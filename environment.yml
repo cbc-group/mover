@@ -1,0 +1,20 @@
+name: mover-dev
+
+channels:
+    - defaults
+    - conda-forge
+
+dependencies:
+    # core
+    - python=3.7
+
+    # linter
+    - flake8
+    
+    # formatter
+    - black
+    
+    # other pip dependencies
+    - pip
+    #- pip:
+    #  - <SOME_PACKAGE>
