@@ -1,13 +1,8 @@
 import logging
-import signal
-import threading
 import time
-from functools import partial
 
-import click
 import coloredlogs
 
-from mover import Mover
 from mover.worker import Worker
 
 coloredlogs.install(

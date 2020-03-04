@@ -17,6 +17,7 @@ class FileEventHandler(FileSystemEventHandler):
         self._mq = mq
 
     def on_created(self, event):
+        logger.debug(f'new event "{os.path.basename(event.src_path)}"')
         self._mq.put(event)
 
 
@@ -54,6 +55,7 @@ class Worker(object):
         self._mq = SimpleQueue()
         # mover is the actual work horse
         self._flush_queue_event = threading.Event()
+        self._stop_mover_event = threading.Event()
         self._mover = threading.Thread(target=self._mover, name="mover")
         # watchdog determine if worker has been idle for too long
         self._t0 = -1  # internal timestamp book-keeping
@@ -120,6 +122,7 @@ class Worker(object):
                     else:
                         event_class = FileCreatedEvent
                     event = event_class(entry.path)
+                    logger.debug(f'new event "{os.path.basename(entry.path)}"')
                     self._mq.put(event)
 
         # set observer
@@ -128,6 +131,7 @@ class Worker(object):
 
         # set mover
         self._flush_queue_event.clear()
+        self._stop_mover_event.clear()
         self._mover.start()
 
         # set watchdog
@@ -140,15 +144,15 @@ class Worker(object):
         self._kill_watchdog_event.set()
         self._watchdog.join()
 
-        # stop mover
-        self._mq.put(None)  # poison pill
-        self._flush_queue_event.set()
-        self._mover.join()
-
         # stop observer
         self._observer.stop()
         self._observer.join()
         self._observer.unschedule_all()
+
+        # stop mover
+        self._flush_queue_event.set()
+        self._stop_mover_event.set()
+        self._mover.join()
 
         # cleanup directories
         logger.info(f"remove empty directories")
@@ -177,8 +181,7 @@ class Worker(object):
 
     def _mover(self):
         logger.debug("mover started")
-        is_poisoned = False
-        while not is_poisoned:
+        while True:
             n_events = 0
             if self._mq.qsize() > self.threshold:
                 n_events = self._mq.qsize() - self.threshold
@@ -196,11 +199,6 @@ class Worker(object):
                 self._pet_watchdog()
 
             for event in events:
-                if event is None:
-                    # poison, stop mover
-                    is_poisoned = True
-                    break
-
                 # generate target path
                 rel_path = os.path.relpath(event.src_path, self.src)
                 dst_path = os.path.join(self.dst, rel_path)
@@ -227,6 +225,11 @@ class Worker(object):
                     logger.error(f'"{filename}" was moved after being monitored')
                 except Exception as err:
                     logger.exception(f'unable to handle "{err.__class__.__name__}"')
+
+            if self._stop_mover_event.is_set():
+                if self._mq.empty():
+                    break
+                # if not empty, run one more time
         logger.debug("mover stopped")
 
     ##

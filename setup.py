@@ -15,5 +15,5 @@ setup(
     install_requires=["click", "coloredlogs", "pystray", "watchdog"],
     zip_safe=True,
     extras_require={},
-    entry_points={"console_scripts": []},
+    entry_points={"console_scripts": ["mover=mover.main:cli"]},
 )
