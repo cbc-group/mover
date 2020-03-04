@@ -1,16 +1,31 @@
+import time
+
+import coloredlogs
+
 from mover import Mover
 from mover.worker import Worker
 
-# mover = Mover()
-# mover.start()
+coloredlogs.install(
+    level="DEBUG", fmt="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
+)
 
-worker = Worker()
-worker.set_source("C:/Users/Andy/Desktop/test_ground/src")
-worker.set_destination("C:/Users/Andy/Desktop/test_ground/dst")
-worker.set_number_of_backlogs(5)
 
-worker.start()
+def main():
+    # mover = Mover()
+    # mover.start()
 
-input("Press Enter to stop...")
+    worker = Worker(timeout=10)
+    worker.src = "C:/Users/Andy/Desktop/test_ground/src"
+    worker.dst = "C:/Users/Andy/Desktop/test_ground/dst"
+    worker.threshold = 10
+    worker.start()
 
-worker.stop()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        worker.stop()
+
+
+if __name__ == "__main__":
+    main()
