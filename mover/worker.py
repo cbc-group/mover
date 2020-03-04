@@ -2,13 +2,10 @@ import logging
 import os
 import time
 import threading
-import queue
 from queue import SimpleQueue
-from shutil import copytree
-from dataclasses import dataclass
 
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEventHandler, DirCreatedEvent, FileCreatedEvent
 
 __all__ = ["Worker"]
 
@@ -37,24 +34,6 @@ def property_guard(func):
             self.start()
 
     return wrapper
-
-
-def move_tree(src, dst):
-    """
-    The standard shutil.copytree causes error when root folder exists.
-
-    Reference:
-        How do I copy an entire directory of files into an existing directory using     
-            Python? https://stackoverflow.com/a/12514470
-    """
-    # iterate over items in the top level folder
-    for item in os.listdir(src):
-        s = os.path.join(src, item)
-        d = os.path.join(dst, item)
-        if os.path.isdir(s):
-            copytree(s, d, copy_function=os.rename)
-        else:
-            os.rename(s, d)
 
 
 class Worker(object):
@@ -127,22 +106,21 @@ class Worker(object):
         assert self.dst is not None, "dst dir not specified"
         assert self.threshold >= 0, "backlog threshold not specified"
 
+        # push everything to the queue
+        logger.info("populating src dir content")
         scan_queue = [self.src]
-        need_copytree = False
         while scan_queue:
             src_dir = scan_queue.pop(0)
+            logger.debug(f'scanning "{src_dir}"')
             with os.scandir(src_dir) as it:
                 for entry in it:
-                    if entry.is_file():
-                        # wipe the queue and set copy flag
-                        scan_queue.clear()
-                        need_copytree = True
-                        break
-                    elif entry.is_dir():
+                    if entry.is_dir():
+                        event_class = DirCreatedEvent
                         scan_queue.append(entry.path)
-        if need_copytree:
-            logger.info("found files in src dir, moving the tree")
-            move_tree(self.src, self.dst)
+                    else:
+                        event_class = FileCreatedEvent
+                    event = event_class(entry.path)
+                    self._mq.put(event)
 
         # set observer
         self._observer.schedule(FileEventHandler(self._mq), self.src, recursive=True)
@@ -172,6 +150,29 @@ class Worker(object):
         self._observer.join()
         self._observer.unschedule_all()
 
+        # cleanup directories
+        logger.info(f"remove empty directories")
+        scan_queue, rm_queue = [self.src], []
+        while scan_queue:
+            src_dir = scan_queue.pop(0)
+            logger.debug(f'scanning "{src_dir}"')
+            with os.scandir(src_dir) as it:
+                is_empty = True
+                for entry in it:
+                    if entry.is_dir():
+                        scan_queue.append(entry.path)
+                    else:
+                        is_empty = False
+
+                if not is_empty:
+                    logger.error(f'"{src_dir}" is not entirely empty')
+                else:
+                    rm_queue.append(src_dir)
+        # remove all the folders in rm_queue, in backward (deeper)
+        # NOTE still keep the src dir
+        for src_dir in reversed(rm_queue[1:]):
+            os.rmdir(src_dir)
+
     ##
 
     def _mover(self):
@@ -182,18 +183,17 @@ class Worker(object):
             if self._mq.qsize() > self.threshold:
                 n_events = self._mq.qsize() - self.threshold
             if self._flush_queue_event.is_set():
-                self._flush_queue_event.clear()
                 n_events = self._mq.qsize()
                 if n_events > 0:
                     logger.info(f"flushing remaining {n_events} event(s) in the queue")
-            events = [self._mq.get() for _ in range(n_events)]
+            events = [self._mq.get(block=False) for _ in range(n_events)]
 
-            if not events:
-                continue
-            else:
-                # we are going to do something, pet the dog
+            if events or self._flush_queue_event.is_set():
+                # pet the watch dog if:
+                #   - we have some events to process
+                #   - acknowledge watchdog timeout
+                self._flush_queue_event.clear()
                 self._pet_watchdog()
-                logger.info(f"processing {len(events)} event(s)")
 
             for event in events:
                 if event is None:
@@ -205,19 +205,33 @@ class Worker(object):
                 rel_path = os.path.relpath(event.src_path, self.src)
                 dst_path = os.path.join(self.dst, rel_path)
 
-                if event.is_directory:
-                    # create directory
-                    logger.debug(f'mkdir "{os.path.basename(dst_path)}"')
-                    os.makedirs(dst_path)
-                else:
-                    # move file
-                    logger.debug(f'mv "{os.path.basename(dst_path)}"')
-                    os.rename(event.src_path, dst_path)
+                filename = os.path.basename(dst_path)
+                try:
+                    if event.is_directory:
+                        # create directory
+                        logger.debug(f'mkdir "{filename}"')
+                        try:
+                            os.makedirs(dst_path)
+                        except FileExistsError:
+                            logger.warning(f'"{filename}" exists')
+                    else:
+                        # move file
+                        logger.debug(f'mv "{filename}"')
+                        try:
+                            os.rename(event.src_path, dst_path)
+                        except PermissionError:
+                            logger.error(f'"{filename}" blocked, please extend timeout')
+                            # requeue the file and attempt later
+                            self._mq.put(event)
+                except FileNotFoundError:
+                    logger.error(f'"{filename}" was moved after being monitored')
+                except Exception as err:
+                    logger.exception(f'unable to handle "{err.__class__.__name__}"')
         logger.debug("mover stopped")
 
     ##
 
-    def _watchdog(self, timeout: int, update_rate=5):
+    def _watchdog(self, timeout: int, update_rate=1):
         """
         The watchdog activity.
 
@@ -227,15 +241,14 @@ class Worker(object):
         """
         self._pet_watchdog()
 
-        print(timeout)
         logger.debug("watchdog started")
         while True:
             if self._kill_watchdog_event.wait(update_rate):
                 break
 
             dt = time.time() - self._t0
-            if dt > timeout:
-                logger.info(f"watchdog timeout, bark")
+            if timeout > 0 and dt > timeout:
+                logger.debug(f"watchdog timeout, bark")
                 self._flush_queue_event.set()
         logger.debug("watchdog stopped")
 
