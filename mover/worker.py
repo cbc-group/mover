@@ -46,9 +46,10 @@ class Worker(object):
         timeout (int, optional): worker terminates itself after timeout, in seconds
     """
 
-    def __init__(self, timeout=300):
+    def __init__(self):
         self._src, self._dst = None, None
         self._threshold = -1
+        self._timeout = 0
 
         # observer monitors the source directory
         self._observer = Observer()
@@ -60,9 +61,7 @@ class Worker(object):
         # watchdog determine if worker has been idle for too long
         self._t0 = -1  # internal timestamp book-keeping
         self._kill_watchdog_event = threading.Event()
-        self._watchdog = threading.Thread(
-            target=self._watchdog, args=(timeout,), name="watchdog"
-        )
+        self._watchdog = threading.Thread(target=self._watchdog, name="watchdog")
 
     ##
 
@@ -75,6 +74,16 @@ class Worker(object):
     def threshold(self, threshold: int):
         assert threshold > 0, "backlog threshold should >= 0"
         self._threshold = threshold
+
+    @property
+    def timeout(self) -> int:
+        return self._timeout
+
+    @timeout.setter
+    @property_guard
+    def timeout(self, timeout: int):
+        assert timeout >= 0, "timeout should >= 0"
+        self._timeout = timeout
 
     @property
     def src(self) -> str:
@@ -99,6 +108,10 @@ class Worker(object):
     @property
     def is_running(self) -> bool:
         return self._mover.is_alive()
+
+    @property
+    def is_valid(self) -> bool:
+        return self.src is not None and self.dst is not None
 
     ##
 
@@ -234,12 +247,11 @@ class Worker(object):
 
     ##
 
-    def _watchdog(self, timeout: int, update_rate=1):
+    def _watchdog(self, update_rate=1):
         """
         The watchdog activity.
 
         Args:
-            timeout (int): timeout in seconds
             update_rate (int, optional): watchdog update interval, in seconds
         """
         self._pet_watchdog()
@@ -250,7 +262,7 @@ class Worker(object):
                 break
 
             dt = time.time() - self._t0
-            if timeout > 0 and dt > timeout:
+            if self._timeout > 0 and dt > self._timeout:
                 logger.debug(f"watchdog timeout, bark")
                 self._flush_queue_event.set()
         logger.debug("watchdog stopped")

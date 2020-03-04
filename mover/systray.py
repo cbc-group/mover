@@ -43,6 +43,13 @@ class SystrayIcon(object):
                 MenuItem("25", partial(self.on_number_of_backlogs_changed, 25)),
             ),
         )
+        self._timeout = MenuItem(
+            'Timeout',
+            Menu(
+                MenuItem('Never', partial(self.on_timeout_changed, 0)),
+                MenuItem('30 s', partial(self.on_timeout_changed, 30))
+            )
+        )
         self._exit = MenuItem("Exit", self.on_exit)
         self._icon.menu = Menu(
             self._start_stop,
@@ -84,6 +91,11 @@ class SystrayIcon(object):
 
     def on_number_of_backlogs_changed(self, n):
         self._worker.set_number_of_backlogs(n)
+
+    def on_timeout_changed(self, t):
+        self._worker.stop()
+        self._worker = Worker(t)
+
 
     def on_exit(self):
         logger.debug(f"systray stopped")
