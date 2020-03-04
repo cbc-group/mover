@@ -1,5 +1,11 @@
 import logging
 import os
+import time
+import threading
+import queue
+from queue import SimpleQueue
+from shutil import copytree
+from dataclasses import dataclass
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -9,99 +15,161 @@ __all__ = ["Worker"]
 logger = logging.getLogger(__name__)
 
 
-class NewFileEventHandler(FileSystemEventHandler):
-    def __init__(self, threshold, source, destination):
-        self._files = []
-        self._threshold = threshold
-        self._source, self._destination = source, destination
+class FileEventHandler(FileSystemEventHandler):
+    def __init__(self, mq: SimpleQueue):
+        self._mq = mq
 
     def on_created(self, event):
-        if event.is_directory:
-            # create it but do nothing
-            dst_dir = self._get_destination_path(event.src_path)
-            logger.debug(f'mkdir "{dst_dir}"')
-            os.makedirs(dst_dir)
-        else:
-            self._files.append(event.src_path)
-
-            if len(self._files) >= self._threshold:
-                # trigger move file
-                src_path = self._files.pop(0)
-                dst_path = self._get_destination_path(src_path)
-                logger.debug(f'mv "{dst_path}"')
-                os.rename(src_path, dst_path)
-
-    ##
-
-    def _get_destination_path(self, path):
-        rel_path = os.path.relpath(path, self._source)
-        abs_path = os.path.join(self._destination, rel_path)
-        return abs_path
+        self._mq.put(event)
 
 
 class Worker(object):
-    def __init__(self):
-        self._source, self._destination = None, None
-        self._n_backlogs = 10
+    """
+    Worker monitors files in the source directory and moves it to the destination directory.
 
+    Args:
+        threshold (int, optional): backlog threshold
+        timeout (int, optional): worker terminates itself after timeout, in seconds
+    """
+
+    def __init__(self, timeout=300):
+        self._src, self._dst = None, None
+        self._threshold = -1
+
+        # observer monitors the source directory
         self._observer = Observer()
+        self._mq = SimpleQueue()
+        # mover is the actual work horse
+        self._flush_queue_event = threading.Event()
+        self._mover = threading.Thread(target=self._mover, name="mover")
+        # watchdog determine if worker has been idle for too long
+        self._t0 = -1 # internal timestamp book-keeping
+        self._kill_watchdog_event = threading.Event()
+        self._watchdog = threading.Thread(
+            target=self._watchdog, args=(timeout,), name="watchdog"
+        )
 
     ##
 
     @property
-    def can_run(self):
-        return self._source is not None and self._destination is not None
+    def threshold(self) -> int:
+        return self._threshold
+
+    @threshold.setter
+    def threshold(self, threshold: int):
+        # TODO  stop and restart the loop if necessary
+
+        assert threshold > 0, "backlog threshold should >= 0"
+        self._threshold = threshold
 
     @property
-    def is_running(self):
-        return self._observer.is_alive()
+    def src(self) -> str:
+        return self._src
+
+    @property
+    def dst(self) -> str:
+        return self._dst
 
     ##
 
     def start(self):
-        handler = NewFileEventHandler(self._n_backlogs, self._source, self._destination)
-        self._observer.schedule(handler, self._source, recursive=True)
+        """Start the worker activity."""
+        with os.scandir(self.src) as it:
+            for entry in it:
+                if entry.is_file():
+                    need_copytree = True
+                    break
+            else:
+                need_copytree = False
+        if need_copytree > 0:
+            logger.info("found files in src dir, moving the tree")
+            copytree(
+                self.src,
+                self.dst,
+                copy_function=lambda src, dst, follow_symlinks: os.rename(src, dst),
+            )
+
+        # set observer
+        self._observer.schedule(FileEventHandler(self._mq), self.src, recursive=True)
         self._observer.start()
 
-    def stop(self):
-        if self.is_running:
-            self._observer.stop()
-            self._observer.join()
+        # set mover
+        self._flush_queue_event.clear()
+        self._mover.start()
 
-        # cleanup
+        # set watchdog
+        self._kill_watchdog_event.clear()
+        self._watchdog.start()
+
+    def stop(self):
+        """Stop the worker activity."""
+        # stop watchdog
+        self._kill_watchdog_event.set()
+        self._watchdog.join()
+
+        # stop mover
+        self._mq.put(None)  # poison pill
+        self._mover.join()
+
+        # stop observer
+        self._observer.stop()
+        self._observer.join()
         self._observer.unschedule_all()
 
     ##
 
-    def set_source(self, path):
-        resume = self.is_running
-        self.stop()
+    def _mover(self):
+        logger.debug("mover started")
+        is_poisoned = False
+        while is_poisoned:
+            n_events = 0
+            if self._mq.qsize() > self.threshold:
+                n_events = self._mq.qsize() - self.threshold
+            if self._flush_queue_event:
+                self._flush_queue_event.clear()
+                n_events = self._mq.qsize()
+                logger.info(f"flushing remaining {n_events} event(s) in the queue")
+            events = [self._mq.get() for _ in range(n_events)]
 
-        logger.info(f'update source to "{path}"')
-        if os.listdir(path):
-            logger.error(f"source directory is not empty, abort")
-            self._source = None
-            return
-        self._source = path
+            # we are doing something, pet the dog
+            self._pet_watchdog()
 
-        if resume:
-            self.start()
+            for event in events:
+                if event is None:
+                    # poison, stop mover
+                    is_poisoned = True
 
-    def set_destination(self, path):
-        resume = self.is_running
-        self.stop()
+                if event.is_dir:
+                    # create directory
+                    pass
+                else:
+                    # move file
+                    pass
+        logger.debug("mover stopped")
 
-        logger.info(f'update destination to "{path}"')
-        self._destination = path
+    ##
 
-        if resume:
-            self.start()
+    def _watchdog(self, timeout: int, update_rate=5):
+        """
+        The watchdog activity.
 
-    def set_number_of_backlogs(self, n):
-        resume = self.is_running
-        self.stop()
+        Args:
+            timeout (int): timeout in seconds
+            update_rate (int, optional): watchdog update interval, in seconds
+        """
+        self._pet_watchdog()
 
-        self._n_backlogs = n
+        logger.debug("watchdog started")
+        while True:
+            if self._kill_watchdog_event.wait(update_rate):
+                break
 
-        if resume:
-            self.start()
+            dt = time.time() - self._t0
+            if dt > timeout:
+                logger.info(f"flushing remaining files due to watchdog timeout")
+                self._flush_queue_event.set()
+        logger.debug("watchdog stopped")
+
+    def _pet_watchdog(self):
+        self._t0 = time.time()
+        logger.debug(f"watchdog pet at t:{self._t0}")
