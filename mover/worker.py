@@ -1,11 +1,12 @@
 import logging
 import os
-import time
+import shutil
 import threading
+import time
 from queue import SimpleQueue
 
+from watchdog.events import DirCreatedEvent, FileCreatedEvent, FileSystemEventHandler
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, DirCreatedEvent, FileCreatedEvent
 
 __all__ = ["Worker"]
 
@@ -229,7 +230,7 @@ class Worker(object):
                         # move file
                         logger.debug(f'mv "{filename}"')
                         try:
-                            os.rename(event.src_path, dst_path)
+                            shutil.move(event.src_path, dst_path)
                         except PermissionError:
                             logger.error(f'"{filename}" blocked, please extend timeout')
                             # requeue the file and attempt later
